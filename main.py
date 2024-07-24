@@ -6,19 +6,22 @@ class ProcessController:
     def __init__(self):
         self.max_proc = 1
         self.task_queue = mp.Queue()
-        self.current_processes = []
         self.manager = mp.Manager()
         self.active_tasks = self.manager.list()
+        self.current_processes = []
+        self.active_count = mp.Value('i', 0)
+        self.lock = mp.Lock()
 
     def set_max_proc(self, n):
         self.max_proc = n
 
-    def worker(self, func, args, max_exec_time, stop_event):
-        process = mp.Process(target=self.run_with_timeout, args=(func, args, max_exec_time, stop_event))
+    def worker(self, func, args, max_exec_time, stop_event, active_tasks, active_count):
+        process = mp.Process(target=self.run_with_timeout,
+                             args=(func, args, max_exec_time, stop_event, active_tasks, active_count))
         process.start()
         process.join()
 
-    def run_with_timeout(self, func, args, max_exec_time, stop_event):
+    def run_with_timeout(self, func, args, max_exec_time, stop_event, active_tasks, active_count):
         def target_wrapper(stop_event):
             result = func(*args)
             if stop_event.is_set():
@@ -30,13 +33,15 @@ class ProcessController:
         p.join(max_exec_time)
 
         if p.is_alive():
-            print(f"Задание {func.__name__} с аргументами {args} превысило "
-                  f"лимит времени {max_exec_time} секунд и будет завершено.")
+            print(
+                f"Задание {func.__name__} с аргументами {args} превысило лимит времени {max_exec_time} секунд и будет завершено.")
             stop_event.set()
             p.terminate()
             p.join()
 
-        self.active_tasks.remove(func)
+        active_tasks.remove(func)
+        with active_count.get_lock():
+            active_count.value -= 1
 
     def start(self, tasks, max_exec_time):
         """
@@ -47,47 +52,50 @@ class ProcessController:
         for func, args in tasks:
             self.task_queue.put((func, args, max_exec_time))
 
-        self._process_tasks()
+        process = mp.Process(target=self._process_tasks)
+        process.start()
+        self.current_processes.append(process)
 
     def _process_tasks(self):
-        while self.current_processes or not self.task_queue.empty():
-            while not self.task_queue.empty() and len(self.current_processes) < self.max_proc:
+        local_processes = []
+        while not self.task_queue.empty() or self.alive_count() > 0:
+            while not self.task_queue.empty() and self.alive_count() < self.max_proc:
                 func, args, max_exec_time = self.task_queue.get()
                 stop_event = mp.Event()
                 self.active_tasks.append(func)
-                p = mp.Process(target=self.worker, args=(func, args, max_exec_time, stop_event))
-                self.current_processes.append(p)
+                with self.active_count.get_lock():
+                    self.active_count.value += 1
+                p = mp.Process(target=self.worker,
+                               args=(func, args, max_exec_time, stop_event, self.active_tasks, self.active_count))
+                local_processes.append(p)
                 p.start()
-            self._cleanup_processes()
+                self.current_processes.append(p)
+
+            self._cleanup_processes(local_processes)
             time.sleep(0.1)
-            # self.print_status()
 
-    def _cleanup_processes(self):
-        self.current_processes = [p for p in self.current_processes if p.is_alive()]
-
-    def print_status(self):
-        print(f"Активные задания: {self.alive_count()}")
-        print(f"Задания в очереди: {self.wait_count()}")
+    def _cleanup_processes(self, local_processes):
+        for p in local_processes:
+            if not p.is_alive():
+                local_processes.remove(p)
 
     def wait(self):
-        """
-        Ждет пока не завершат своё выполнение все задания из очереди.
-        :return:
-        """
-        for p in self.current_processes:
-            p.join()
+        while self.alive_count() > 0 or not self.task_queue.empty():
+            self._cleanup_processes(self.current_processes)
+            time.sleep(0.1)
 
     def wait_count(self):
         """
-        :return: число заданий, которые осталось запустить.
+        :return: Количество заданий в очереди.
         """
         return self.task_queue.qsize()
 
     def alive_count(self):
         """
-        :return: число выполняемых в данный момент заданий.
+        :return: Количество активных процессов.
         """
-        return len([p for p in self.current_processes if p.is_alive()])
+        with self.active_count.get_lock():
+            return self.active_count.value
 
 
 # Пример использования класса ProcessController
@@ -125,4 +133,18 @@ if __name__ == "__main__":
     controller = ProcessController()
     controller.set_max_proc(3)
     controller.start(tasks, max_exec_time=5)
+
+    # Добавление новых заданий в очередь
+    new_tasks = [
+        (example_task, (2, "E")),
+        (example_task, (2, "F"))
+    ]
+    controller.start(new_tasks, max_exec_time=5)
+
+    # Демонстрация использования wait_count и alive_count
+    while controller.wait_count() > 0 or controller.alive_count() > 0:
+        print(f"Задания в очереди: {controller.wait_count()}")
+        print(f"Активные задания: {controller.alive_count()}")
+        time.sleep(1)
+
     controller.wait()
